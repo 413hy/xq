@@ -1,0 +1,343 @@
+// ==UserScript==
+// @name         Pokmemon 机场自动续期（gpt）
+// @namespace    https://example.com/
+// @version      0.1.0
+// @description  自动跳转最佳线路 -> 登录 -> 关闭公告 -> 续费 -> 输入优惠码(手动) -> 选套餐 -> 订购；遇到人机验证暂停等待人工完成后继续。
+// @author       you
+// @match        https://love.p6m6.com/*
+// @match        https://love.52pokemon66.cc/*
+// @match        https://love.52pokemon88.cc/*
+// @match        https://love.52pokemon99.cc/*
+// @match        https://web4.52pokemon.cc/*
+// @match        https://web1.52pokemon.xyz/*
+// @match        https://web1.52pokemon.top/*
+// @match        https://web4.52pokemon.com/*
+// @match        https://web1.go52pokemon.com/*
+// @match        https://web2.go52pokemon.com/*
+// @run-at       document-idle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /*********************
+   * 配置区（你的 XPath）
+   *********************/
+  const X = {
+    // 入口站：最佳线路按钮
+    bestLineBtn: '/html/body/header/div/div[2]/button[1]',
+
+    // 登录页
+    emailInput: '/html/body/div[1]/div/div/div[2]/div[2]/div/div/div/div/div/div[2]/form/div[1]/div/div/div/div[3]/input',
+    passInput:  '/html/body/div[1]/div/div/div[2]/div[2]/div/div/div/div/div/div[2]/form/div[2]/div/div/div/div[3]/input',
+    loginBtn:   '/html/body/div[1]/div/div/div[2]/div[2]/div/div/div/div/div/div[2]/form/button',
+
+    // 公告弹窗关闭
+    noticeClose: '/html/body/div[3]/div[1]/div[2]/div/div[4]/button/span[3]',
+
+    // 首页续费按钮
+    renewBtn: '/html/body/div[1]/div/div/div/main/div[1]/div/div[3]/div[1]/div/div/div/div/div[2]/div/div/div[1]/div/div/button[2]/span[3]',
+
+    // 续费页：优惠码输入 + 使用优惠码按钮
+    couponInput: '/html/body/div[1]/div/div/div/main/div[1]/div/div[2]/div/div[2]/div[2]/div[3]/div/div[1]/div/div[3]/input',
+    couponApply: '/html/body/div[1]/div/div/div/main/div[1]/div/div[2]/div/div[2]/div[2]/div[4]/div/div/button/span[3]',
+
+    // 选择套餐（你给的是 input）
+    planRadio: '/html/body/div[1]/div/div/div/main/div[1]/div/div[2]/div/div[3]/div/div[2]/div/div/div/div/div[1]/div/div/div/div/input',
+
+    // 订购按钮
+    orderBtn: '/html/body/div[1]/div/div/div/main/div[1]/div/div[2]/div/div[3]/div/div[2]/div/div/div/div/div[6]/button',
+  };
+
+  const CFG = {
+   preClickWaitMs: 3200,
+   afterClickWaitMs: 6500,
+   stepTimeoutMs: 30000,
+   pollMs: 250,
+   captchaPollMs: 800,
+   retryWhenUnknownMs: 1200,
+   unknownMaxRetries: 25,
+
+ };
+
+
+
+  /*********************
+   * 小工具函数
+   *********************/
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  function log(...args) {
+    console.log('[PokmemonRenew]', ...args);
+  }
+
+  function $xpath(xpath, root = document) {
+    try {
+      return document.evaluate(xpath, root, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function waitForXPath(xpath, timeoutMs = CFG.stepTimeoutMs) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const el = $xpath(xpath);
+      if (el) return el;
+      await sleep(CFG.pollMs);
+    }
+    throw new Error(`等待元素超时: ${xpath}`);
+  }
+
+  async function clickXPath(xpath, timeoutMs) {
+    const el = await waitForXPath(xpath, timeoutMs);
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    await sleep(100);
+    el.click();
+    return el;
+  }
+
+  async function typeXPath(xpath, value, timeoutMs) {
+    const el = await waitForXPath(xpath, timeoutMs);
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    await sleep(100);
+
+    // 兼容一些框架的受控输入：先 focus，再设置 value，再触发 input/change
+    el.focus();
+    el.value = value;
+
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return el;
+  }
+
+  /*********************
+   * 人机验证检测与等待
+   *********************/
+  function isCaptchaPresent() {
+    // 常见人机验证特征（尽量通用）
+    const hasRecaptcha = !!document.querySelector('iframe[src*="recaptcha"], div.g-recaptcha, textarea[name="g-recaptcha-response"]');
+    const hasHcaptcha = !!document.querySelector('iframe[src*="hcaptcha"], div.h-captcha, textarea[name="h-captcha-response"]');
+    const hasTurnstile = !!document.querySelector('iframe[src*="turnstile"], .cf-turnstile, input[name="cf-turnstile-response"]');
+
+    // 一些站点可能用“验证/安全检查”等字样
+    const text = (document.body?.innerText || '').slice(0, 2000);
+    const hasVerifyText = /人机|验证码|安全验证|验证一下|robot|verify|captcha/i.test(text);
+
+    return hasRecaptcha || hasHcaptcha || hasTurnstile || hasVerifyText;
+  }
+
+  function ensureFloatingHint() {
+    const id = 'pokmemon-renew-hint';
+    let box = document.getElementById(id);
+    if (box) return box;
+
+    box = document.createElement('div');
+    box.id = id;
+    box.style.cssText = `
+      position: fixed; right: 12px; bottom: 12px; z-index: 999999;
+      background: rgba(0,0,0,.78); color: #fff; padding: 10px 12px;
+      border-radius: 10px; font-size: 13px; line-height: 1.4;
+      max-width: 320px; box-shadow: 0 8px 24px rgba(0,0,0,.3);
+    `;
+    box.innerHTML = `<b>续期脚本运行中</b><div style="margin-top:6px;">状态：初始化…</div>`;
+    document.body.appendChild(box);
+    return box;
+  }
+
+  function setHint(text) {
+    const box = ensureFloatingHint();
+    const divs = box.querySelectorAll('div');
+    if (divs[0]) divs[0].innerText = `状态：${text}`;
+  }
+
+  async function waitForCaptchaSolvedIfAny() {
+    // 如果存在人机验证，则等待直到它消失
+    if (!isCaptchaPresent()) return;
+
+    setHint('检测到人机验证，请先手动完成（完成后脚本会自动继续）');
+    log('Captcha detected, waiting for user to solve...');
+
+    // 弹一次提示，避免用户没看到
+    alert('检测到人机验证/安全验证，请先手动完成验证。\n完成后脚本会自动继续执行后续续期步骤。');
+
+    while (isCaptchaPresent()) {
+      await sleep(CFG.captchaPollMs);
+    }
+    setHint('人机验证已完成，继续…');
+    log('Captcha solved, continuing...');
+    await sleep(500);
+  }
+
+  /*********************
+   * 账号配置（保存到油猴存储）
+   *********************/
+  const KEY_EMAIL = 'pokmemon_email';
+  const KEY_PASS = 'pokmemon_pass';
+
+  function getCreds() {
+    return {
+      email: GM_getValue(KEY_EMAIL, ''),
+      pass:  GM_getValue(KEY_PASS, ''),
+    };
+  }
+
+  function setCreds(email, pass) {
+    GM_setValue(KEY_EMAIL, email || '');
+    GM_setValue(KEY_PASS, pass || '');
+  }
+
+  GM_registerMenuCommand('设置账号（邮箱/密码）', () => {
+    const curr = getCreds();
+    const email = prompt('请输入登录邮箱：', curr.email || '');
+    if (email === null) return;
+    const pass = prompt('请输入登录密码：', curr.pass || '');
+    if (pass === null) return;
+    setCreds(email.trim(), pass);
+    alert('已保存。刷新页面后脚本会自动使用该账号。');
+  });
+
+  GM_registerMenuCommand('清空已保存账号', () => {
+    setCreds('', '');
+    alert('已清空。');
+  });
+
+  /*********************
+   * 主流程
+   *********************/
+async function run() {
+  ensureFloatingHint();
+  setHint('启动中…');
+
+  // 入口站：先测速再点最佳线路
+  if (location.host === 'love.p6m6.com') {
+    setHint('入口站：页面自动测速中，等待完成…');
+    await waitForCaptchaSolvedIfAny();
+    await sleep(CFG.preClickWaitMs);
+
+    setHint('入口站：点击“最佳线路”…');
+    try {
+      await clickXPath(X.bestLineBtn, CFG.stepTimeoutMs);
+    } catch (e) {
+      setHint('入口站：未找到“最佳线路”按钮（可能已自动跳转）');
+      log(e);
+      return;
+    }
+
+    setHint('入口站：已点击最佳线路，等待跳转…');
+    await sleep(CFG.afterClickWaitMs);
+    return;
+  }
+
+  const creds = getCreds();
+  if (!creds.email || !creds.pass) {
+    setHint('未配置账号：请在油猴菜单里设置邮箱/密码');
+    return;
+  }
+
+  // —— 关键：不管是否已登录，都循环找“下一步能做的事”
+  let retries = 0;
+  while (retries < (CFG.unknownMaxRetries ?? 25)) {
+    await waitForCaptchaSolvedIfAny();
+
+    // 1) 关闭公告弹窗（若存在）
+    const closeBtn = $xpath(X.noticeClose);
+    if (closeBtn) {
+      setHint('检测到公告弹窗，关闭中…');
+      closeBtn.click();
+      await sleep(500);
+      continue;
+    }
+
+    // 2) 若在登录页：执行登录
+    const maybeEmail = $xpath(X.emailInput);
+    const maybePass = $xpath(X.passInput);
+    const maybeLogin = $xpath(X.loginBtn);
+    if (maybeEmail && maybePass && maybeLogin) {
+      setHint('登录页：填写邮箱/密码…');
+      await typeXPath(X.emailInput, creds.email);
+      await typeXPath(X.passInput, creds.pass);
+
+      setHint('登录页：点击登录…');
+      await clickXPath(X.loginBtn);
+      setHint('登录请求已提交，等待页面加载…');
+      await sleep(1500);
+      continue;
+    }
+
+    // 3) 若在首页/仪表盘：点击续费按钮
+    const renew = $xpath(X.renewBtn);
+    if (renew) {
+      setHint('发现“续费”入口，进入续费页面…');
+      renew.click();
+      await sleep(1200);
+      continue;
+    }
+
+    // 4) 若在续费页：处理优惠码 + 选套餐 + 订购
+    const couponEl = $xpath(X.couponInput);
+    if (couponEl) {
+      setHint('续费页：准备输入优惠码…');
+      const coupon = prompt('请输入优惠码（留空则跳过）：', '');
+      if (coupon === null) {
+        setHint('已取消输入优惠码，停止在续费页');
+        return;
+      }
+
+      const c = coupon.trim();
+      if (c) {
+        setHint('填写优惠码并点击“使用优惠码”…');
+        await typeXPath(X.couponInput, c);
+        try {
+          await clickXPath(X.couponApply, 10000);
+        } catch {
+          const span = $xpath(X.couponApply);
+          span?.closest('button')?.click();
+        }
+        await sleep(1200);
+      } else {
+        setHint('未输入优惠码，跳过…');
+      }
+
+      setHint('选择套餐…');
+      const plan = await waitForXPath(X.planRadio, 15000);
+      plan.scrollIntoView({ block: 'center' });
+      await sleep(150);
+      if (!plan.checked) plan.click();
+      await sleep(600);
+
+      setHint('点击订购…（如出现人机验证请完成后继续）');
+      await waitForCaptchaSolvedIfAny();
+
+      const btn = await waitForXPath(X.orderBtn, 15000);
+      btn.scrollIntoView({ block: 'center' });
+      await sleep(150);
+      btn.click();
+
+      await sleep(1200);
+      await waitForCaptchaSolvedIfAny();
+
+      setHint('已提交订购/续期请求：请查看跳转结果页');
+      return;
+    }
+
+    // 5) 兜底：页面未知，等待并重试（解决“已登录但页面还在加载/跳转中/缓存直达”的情况）
+    retries += 1;
+    setHint(`页面未就绪或不在预期节点，等待重试…(${retries}/${CFG.unknownMaxRetries ?? 25})`);
+    await sleep(CFG.retryWhenUnknownMs ?? 1200);
+  }
+
+  setHint('重试次数已到：仍未识别到续期流程节点（可能页面结构已变或不在该站点流程中）');
+}
+
+
+  // 启动
+  run().catch(err => {
+    console.error(err);
+    try { setHint(`发生错误：${err?.message || err}`); } catch {}
+  });
+
+})();
