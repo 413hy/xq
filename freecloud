@@ -1,0 +1,211 @@
+// ==UserScript==
+// @name         freecloud renewal helper
+// @namespace    https://freecloud.ltd/
+// @version      0.1.0
+// @description  Assist with manual Cloudflare verification then automate login and renewal on freecloud.ltd
+// @author       you
+// @match        https://freecloud.ltd/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  const CONFIG_KEYS = {
+    email: 'freecloud_email',
+    password: 'freecloud_password',
+  };
+
+  const XPATHS = {
+    email: '/html/body/section/div/div/section/form/div[1]/div[1]/div[1]/div/input',
+    password: '/html/body/section/div/div/section/form/div[1]/div[1]/div[2]/div/input',
+    captcha: '/html/body/section/div/div/section/form/div[1]/div[2]/div/input',
+    privacy: '/html/body/section/div/div/section/form/div[2]/input',
+    login: '/html/body/section/div/div/section/form/div[3]/button',
+    renewLink: '/html/body/section/section/section/form[2]/div/div/table/tbody/tr/td[12]/a[2]',
+    renewButton: '/html/body/div[6]/div[2]/div/div/div/div/div[3]/div/section/form/div[4]/div/button',
+    renewButtonAlt: '/html/body/div[5]/div[2]/div/div/div/div/div[3]/div/section/form/div[4]/div/button',
+  };
+
+  const log = (...args) => console.log('[freecloud]', ...args);
+
+  const getByXPath = (path) => {
+    const result = document.evaluate(path, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+    return result.singleNodeValue;
+  };
+
+  const promptForCredentials = () => {
+    const email = window.prompt('请输入 freecloud 邮箱');
+    const password = window.prompt('请输入 freecloud 密码');
+    if (email) {
+      GM_setValue(CONFIG_KEYS.email, email);
+    }
+    if (password) {
+      GM_setValue(CONFIG_KEYS.password, password);
+    }
+  };
+
+  const ensureCredentials = () => {
+    const email = GM_getValue(CONFIG_KEYS.email, '');
+    const password = GM_getValue(CONFIG_KEYS.password, '');
+    if (!email || !password) {
+      promptForCredentials();
+    }
+  };
+
+  const parseCaptcha = (input) => {
+    if (!input) return '';
+    const placeholder = input.getAttribute('placeholder') || '';
+    const match = placeholder.match(/(\d+)\s*([+\-*/])\s*(\d+)/);
+    if (!match) return '';
+    const left = Number(match[1]);
+    const operator = match[2];
+    const right = Number(match[3]);
+    if (Number.isNaN(left) || Number.isNaN(right)) return '';
+    switch (operator) {
+      case '+':
+        return String(left + right);
+      case '-':
+        return String(left - right);
+      case '*':
+        return String(left * right);
+      case '/':
+        return right === 0 ? '' : String(Math.floor(left / right));
+      default:
+        return '';
+    }
+  };
+
+  const isCloudflareChallenge = () => {
+    if (document.title.includes('Just a moment')) return true;
+    if (document.querySelector('form[id^="challenge-form"]')) return true;
+    if (document.body && document.body.innerText.includes('Checking your browser')) return true;
+    return false;
+  };
+
+  const waitForChallenge = (callback) => {
+    if (!isCloudflareChallenge()) {
+      callback();
+      return;
+    }
+    log('检测到 Cloudflare 人机验证，等待人工完成...');
+    const interval = window.setInterval(() => {
+      if (!isCloudflareChallenge()) {
+        window.clearInterval(interval);
+        log('人机验证完成，继续执行。');
+        callback();
+      }
+    }, 1000);
+  };
+
+  const handleLogin = () => {
+    const emailInput = getByXPath(XPATHS.email);
+    const passwordInput = getByXPath(XPATHS.password);
+    const captchaInput = getByXPath(XPATHS.captcha);
+    const privacyInput = getByXPath(XPATHS.privacy);
+    const loginButton = getByXPath(XPATHS.login);
+
+    if (!emailInput || !passwordInput || !captchaInput || !privacyInput || !loginButton) {
+      return;
+    }
+
+    const email = GM_getValue(CONFIG_KEYS.email, '');
+    const password = GM_getValue(CONFIG_KEYS.password, '');
+
+    if (email) {
+      emailInput.value = email;
+      emailInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    if (password) {
+      passwordInput.value = password;
+      passwordInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    const captchaValue = parseCaptcha(captchaInput);
+    if (captchaValue) {
+      captchaInput.value = captchaValue;
+      captchaInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    if (!privacyInput.checked) {
+      privacyInput.click();
+    }
+
+    log('尝试登录...');
+    loginButton.click();
+  };
+
+  const handleRenewList = () => {
+    const renewLink = getByXPath(XPATHS.renewLink);
+    if (!renewLink) return;
+    log('进入续期详情页...');
+    renewLink.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    renewLink.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    renewLink.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    renewLink.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    renewLink.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    if (renewLink.href) {
+      window.setTimeout(() => {
+        if (!getByXPath(XPATHS.renewButtonAlt) && !getByXPath(XPATHS.renewButton)) {
+          log('尝试直接访问续期链接...');
+          window.location.href = renewLink.href;
+        }
+      }, 800);
+    }
+    const interval = window.setInterval(() => {
+      const modalButton = getByXPath(XPATHS.renewButtonAlt) || getByXPath(XPATHS.renewButton);
+      const submitButton = document.querySelector('#submitRenew');
+      const renewForm = document.querySelector('#renewForm');
+      if (!modalButton) return;
+      window.clearInterval(interval);
+      log('弹窗确认续期...');
+      if (submitButton) {
+        submitButton.click();
+      } else if (renewForm) {
+        renewForm.submit();
+      } else {
+        modalButton.click();
+      }
+    }, 500);
+  };
+
+  const handleRenewDetail = () => {
+    const renewButton = getByXPath(XPATHS.renewButton) || getByXPath(XPATHS.renewButtonAlt);
+    const submitButton = document.querySelector('#submitRenew');
+    const renewForm = document.querySelector('#renewForm');
+    if (!renewButton && !submitButton && !renewForm) return;
+    log('开始续期...');
+    if (submitButton) {
+      submitButton.click();
+    } else if (renewForm) {
+      renewForm.submit();
+    } else {
+      renewButton.click();
+    }
+  };
+
+  const run = () => {
+    ensureCredentials();
+
+    const path = window.location.pathname;
+    if (path.startsWith('/login')) {
+      handleLogin();
+      return;
+    }
+
+    if (path.startsWith('/server/lxc')) {
+      handleRenewList();
+      return;
+    }
+
+    if (path.startsWith('/server/detail/') && path.endsWith('/renew')) {
+      handleRenewDetail();
+    }
+  };
+
+  GM_registerMenuCommand('设置 freecloud 账号', promptForCredentials);
+
+  waitForChallenge(run);
+})();
